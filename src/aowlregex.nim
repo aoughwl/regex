@@ -1717,28 +1717,35 @@ var
   rxMem*: seq[int] = @[]
   rxTrail: seq[int] = @[]
   rxStk: seq[int] = @[]
+  rxTrailN = 0   ## rxTrail's used length (the seq is only its storage: a
+  rxStkN = 0     ## seq add asks the allocator for the capacity every time)
 
 proc rxSet(i, v: int) {.inline.} =
   if rxMem[i] != v:
-    rxTrail.add i
-    rxTrail.add rxMem[i]
+    if rxTrailN + 2 > rxTrail.len: rxTrail.setLen(max(64, rxTrail.len * 2))
+    rxTrail[rxTrailN] = i
+    rxTrail[rxTrailN + 1] = rxMem[i]
+    rxTrailN += 2
     rxMem[i] = v
 
 proc rxUndo(tl: int) =
-  var k = rxTrail.len
+  var k = rxTrailN
   while k > tl:
     k -= 2
     rxMem[rxTrail[k]] = rxTrail[k+1]
-  rxTrail.shrink(tl)
+  rxTrailN = tl
 
 proc rxPush(kind, pc, pos, x, y, z: int) {.inline.} =
-  rxStk.add kind
-  rxStk.add pc
-  rxStk.add pos
-  rxStk.add rxTrail.len
-  rxStk.add x
-  rxStk.add y
-  rxStk.add z
+  if rxStkN + rxChW > rxStk.len: rxStk.setLen(max(7 * 64, rxStk.len * 2))
+  let b = rxStkN
+  rxStk[b] = kind
+  rxStk[b + 1] = pc
+  rxStk[b + 2] = pos
+  rxStk[b + 3] = rxTrailN
+  rxStk[b + 4] = x
+  rxStk[b + 5] = y
+  rxStk[b + 6] = z
+  rxStkN = b + rxChW
 
 # The subject: a borrowed pointer to UTF-16 code units (wide) or to Latin-1
 # bytes (narrow, each byte one code unit), bound once per search with
@@ -1861,7 +1868,7 @@ proc rxBackref(pr: RxProg; pc, n, pos: int): int =
 proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
   ## Resume at the most recent live choice point; false when none is left.
   while true:
-    let top = rxStk.len - rxChW
+    let top = rxStkN - rxChW
     if top < 0: return false
     let kind = rxStk[top]
     rxUndo(rxStk[top+3])
@@ -1869,14 +1876,14 @@ proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
     of rckAlt:
       pc = rxStk[top+1]
       pos = rxStk[top+2]
-      rxStk.shrink(top)
+      rxStkN = top
       return true
     of rckLookPos:
-      rxStk.shrink(top)
+      rxStkN = top
     of rckLookNeg:
       pc = rxStk[top+1]
       pos = rxStk[top+2]
-      rxStk.shrink(top)
+      rxStkN = top
       return true
     of rckRunG:
       let count = rxStk[top+4]
@@ -1892,7 +1899,7 @@ proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
       pc = rxStk[top+1]
       pos = p0
       if count - 1 <= mn:
-        rxStk.shrink(top)
+        rxStkN = top
       else:
         rxStk[top+2] = p0
         rxStk[top+4] = count - 1
@@ -1902,11 +1909,11 @@ proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
       let mx = rxStk[top+5]
       let mpc = rxStk[top+6]
       if count >= mx:
-        rxStk.shrink(top)
+        rxStkN = top
         continue
       let np = rxMatch1(pr, pr.code[mpc], pr.code[mpc+1], n, rxStk[top+2])
       if np < 0:
-        rxStk.shrink(top)
+        rxStkN = top
         continue
       rxStk[top+2] = np
       rxStk[top+4] = count + 1
@@ -1914,7 +1921,7 @@ proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
       pos = np
       return true
     else:
-      rxStk.shrink(top)
+      rxStkN = top
 
 proc rxRunN*(pi, n, start: int): bool =
   ## Try to match program `pi` against the bound subject (length n) at
@@ -1924,8 +1931,8 @@ proc rxRunN*(pi, n, start: int): bool =
   let memLen = ncap2 + rxProgs[pi].nregs
   while rxMem.len < memLen: rxMem.add -1
   for k in 0 ..< ncap2: rxMem[k] = -1
-  rxTrail.shrink(0)
-  rxStk.shrink(0)
+  rxTrailN = 0
+  rxStkN = 0
   var pc = 0
   var pos = start
   while true:
@@ -2048,7 +2055,7 @@ proc rxRunN*(pi, n, start: int): bool =
     of roLook:
       let neg = rxProgs[pi].code[pc+1] == 1
       rxPush(if neg: rckLookNeg else: rckLookPos, rxProgs[pi].code[pc+3], pos, 0, 0, 0)
-      rxSet(ncap2 + rxProgs[pi].code[pc+2], rxStk.len - rxChW)
+      rxSet(ncap2 + rxProgs[pi].code[pc+2], rxStkN - rxChW)
       pc += 4
     of roLookEnd:
       let b = rxMem[ncap2 + rxProgs[pi].code[pc+1]]
@@ -2056,7 +2063,7 @@ proc rxRunN*(pi, n, start: int): bool =
       let savedPos = rxStk[b+2]
       let cont = rxStk[b+1]
       let tl = rxStk[b+3]
-      rxStk.shrink(b)
+      rxStkN = b
       if kind == rckLookPos:
         pos = savedPos
         pc = cont
