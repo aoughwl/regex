@@ -1417,6 +1417,8 @@ type
     firstOp*: int            ## every match starts with this forward matcher, or -1
     firstArg*: int
     fbits*: int              ## 1 g, 2 y, 4 d, 8 u or v
+    hasFirst*: bool          ## firstLat is a valid filter
+    firstLat*: seq[bool]     ## [c < 256]: may a match start at unit c?
 
 var rxProgs*: seq[RxProg] = @[]   ## compiled programs; rxCompile returns an index
 
@@ -1632,6 +1634,65 @@ proc rxIsAnchored(p: RxP; nd: int): bool =
   if k == rkGroup: return rxIsAnchored(p, p.nodes[nd].kids[0])
   false
 
+proc rxFirstSet(pr: var RxProg) =
+  ## A conservative Latin-1 filter on the first code unit of any match:
+  ## firstLat[c] false = no match can start where the subject holds unit c
+  ## (c < 256). Walks the program from pc 0 over every zero-width and
+  ## control instruction; gives up (hasFirst = false) at anything that can
+  ## match empty or that it does not model.
+  var lat: seq[bool] = @[]
+  for c in 0 ..< 256: lat.add false
+  var seen: seq[bool] = @[]
+  for k in 0 ..< pr.code.len: seen.add false
+  var work: seq[int] = @[0]
+  var steps = 0
+  while work.len > 0:
+    var pc = work[work.len - 1]
+    var nw: seq[int] = @[]
+    for k in 0 ..< work.len - 1: nw.add work[k]
+    work = nw
+    while true:
+      inc steps
+      if steps > 4000: return
+      if pc < 0 or pc >= pr.code.len: return
+      if seen[pc]: break
+      seen[pc] = true
+      let op = pr.code[pc]
+      if (op and roBack) != 0: return
+      case op
+      of roChar, roCharI, roAny, roAnyAll, roClass:
+        let arg = pr.code[pc+1]
+        for c in 0 ..< 256:
+          if not lat[c]:
+            var ok = false
+            case op
+            of roChar: ok = c == arg
+            of roCharI: ok = c == arg or rxCanon(c, pr.u) == arg
+            of roAny: ok = not rxIsLT(c)
+            of roAnyAll: ok = true
+            else: ok = pr.classes[arg].lat[c]
+            if ok: lat[c] = true
+        break
+      of roRun:
+        let mop = pr.code[pc+4]
+        if (mop and roBack) != 0: return
+        work.add pc + 4   # the matcher's own two words
+        if pr.code[pc+1] >= 1: break
+        pc += 6
+      of roBol, roBolM, roEol, roEolM: inc pc
+      of roWordB, roNotWordB, roMark, roLoopInit: pc += 2
+      of roSaveGroup, roResetCaps: pc += 3
+      of roJmp: pc = pr.code[pc+1]
+      of roSplitNext, roSplitJump:
+        work.add pr.code[pc+1]
+        pc += 2
+      of roLoopHead:
+        if pr.code[pc+2] == 0: work.add pr.code[pc+5]
+        pc += 6
+      else: return
+  pr.firstLat = lat
+  pr.hasFirst = true
+
 proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
   ## Parse + compile. Returns the program index, or -1 with `err` set.
   var p = RxP(s: @[], i: 0, u: false, v: false, n: false, icase: false, err: "",
@@ -1670,6 +1731,7 @@ proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
     return -1
   var pr = RxProg(code: @[], classes: @[], ncaps: p.ngroups + 1, nregs: 0, names: @[],
                   hasNames: p.hasNames, u: p.u, anchored: false, firstUnit: -1, firstOp: -1, firstArg: 0,
+                  hasFirst: false, firstLat: @[],
                   fbits: (if rxHasFlagC(flags, 'g'): 1 else: 0) or (if rxHasFlagC(flags, 'y'): 2 else: 0) or
                          (if rxHasFlagC(flags, 'd'): 4 else: 0) or (if p.u: 8 else: 0))
   pr.names.add @[]
@@ -1693,6 +1755,7 @@ proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
       if mop == roChar or mop == roCharI or mop == roClass:
         pr.firstOp = mop
         pr.firstArg = pr.code[fpc+5]
+  rxFirstSet(pr)
   rxProgs.add pr
   rxProgs.len - 1
 
@@ -1818,6 +1881,33 @@ proc rxMatch1*(pr: RxProg; op, arg, n, pos: int): int =
   if not ok: return -1
   if back: pos - w else: pos + w
 
+proc rxRunFwd(pr: RxProg; mop, marg, n, pos, mx: int): int =
+  ## Non-u forward greedy run of a single-unit matcher: the end of the
+  ## longest run of at most mx matches from pos (each match is one unit).
+  var lim = n
+  if mx < n - pos: lim = pos + mx
+  var p = pos
+  let op = mop and 63
+  if op == roClass:
+    if rxIsWide:
+      while p < lim:
+        let c = int(rxWideP[p])
+        if c < 256:
+          if not pr.classes[marg].lat[c]: break
+        elif rxMatch1(pr, mop, marg, n, p) < 0: break
+        inc p
+    else:
+      while p < lim and pr.classes[marg].lat[int(uint8(rxNarrowP[p]))]: inc p
+  elif op == roChar:
+    while p < lim and rxU(p) == marg: inc p
+  elif op == roAnyAll:
+    p = lim
+  elif op == roAny:
+    while p < lim and not rxIsLT(rxU(p)): inc p
+  else:
+    while p < lim and rxMatch1(pr, mop, marg, n, p) >= 0: inc p
+  p
+
 proc rxBackref(pr: RxProg; pc, n, pos: int): int =
   ## The new position after a backreference, or -1.
   let op = pr.code[pc]
@@ -1889,8 +1979,11 @@ proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
       let count = rxStk[top+4]
       let mn = rxStk[top+5]
       var p0 = rxStk[top+2]
-      var w = 0
-      if rxStk[top+6] == 0:
+      var w = 1
+      if not pr.u:
+        if rxStk[top+6] == 0: p0 -= 1
+        else: p0 += 1
+      elif rxStk[top+6] == 0:
         discard rxReadB(p0, pr.u, w)
         p0 -= w
       else:
@@ -1927,6 +2020,9 @@ proc rxRunN*(pi, n, start: int): bool =
   ## Try to match program `pi` against the bound subject (length n) at
   ## exactly `start`. On success rxMem[0..1] is the match and
   ## rxMem[2g..2g+1] the captures (-1 = unset).
+  if start < n and rxProgs[pi].hasFirst:
+    let c0 = rxU(start)
+    if c0 < 256 and not rxProgs[pi].firstLat[c0]: return false
   let ncap2 = rxProgs[pi].ncaps * 2
   let memLen = ncap2 + rxProgs[pi].nregs
   while rxMem.len < memLen: rxMem.add -1
@@ -1940,6 +2036,12 @@ proc rxRunN*(pi, n, start: int): bool =
     let op = rxProgs[pi].code[pc]
     case op and 63
     of roChar, roCharI, roAny, roAnyAll, roClass:
+      if op == roChar and rxProgs[pi].code[pc+1] < 0xD800:
+        if pos < n and rxU(pos) == rxProgs[pi].code[pc+1]:
+          inc pos
+          pc += 2
+        elif not rxBacktrack(rxProgs[pi], n, pc, pos): return false
+        continue
       let np = rxMatch1(rxProgs[pi], op, rxProgs[pi].code[pc+1], n, pos)
       if np < 0: failed = true
       else:
@@ -2028,7 +2130,16 @@ proc rxRunN*(pi, n, start: int): bool =
       let cont = pc + 6
       var count = 0
       var p2 = pos
-      if greedy:
+      if greedy and not rxProgs[pi].u and (mop and roBack) == 0:
+        p2 = rxRunFwd(rxProgs[pi], mop, marg, n, pos, mx)
+        count = p2 - pos
+        if count < mn: failed = true
+        else:
+          if count > mn:
+            rxPush(rckRunG, cont, p2, count, mn, 0)
+          pos = p2
+          pc = cont
+      elif greedy:
         while count < mx:
           let np = rxMatch1(rxProgs[pi], mop, marg, n, p2)
           if np < 0: break
@@ -2119,6 +2230,16 @@ proc rxScanN*(pi, n, li0: int; fullUnicode: bool): int =
       var k = st
       while k < n and rxMatch1(rxProgs[pi], fop, farg, n, k) < 0: inc k
       if k >= n: return -1
+      if k > st:
+        st = k
+        li = k
+    elif rxProgs[pi].hasFirst and not fullUnicode:
+      # skip the units no match can start with (a match may still start at n)
+      var k = st
+      while k < n:
+        let c = rxU(k)
+        if c >= 256 or rxProgs[pi].firstLat[c]: break
+        inc k
       if k > st:
         st = k
         li = k
