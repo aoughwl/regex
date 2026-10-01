@@ -1639,7 +1639,10 @@ proc rxIsAnchored(p: RxP; nd: int): bool =
   if k == rkGroup: return rxIsAnchored(p, p.nodes[nd].kids[0])
   false
 
-proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
+var rxSeen: seq[int] = @[]   ## rxFirstFrom's visited marks (generation stamps)
+var rxSeenGen = 0
+
+proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]; maxSteps: int): bool =
   ## A conservative Latin-1 filter on the first code unit of any match of
   ## the program from `start` at a position pos < n: lat[c] false = no
   ## match can proceed where the subject holds unit c (c < 256). Walks over
@@ -1647,8 +1650,9 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
   ## anything that can match empty or that it does not model.
   lat = @[]
   for c in 0 ..< 256: lat.add false
-  var seen: seq[bool] = @[]
-  for k in 0 ..< pr.code.len: seen.add false
+  while rxSeen.len < pr.code.len: rxSeen.add 0
+  inc rxSeenGen
+  let gen = rxSeenGen
   var work: seq[int] = @[start]
   var wn = 1
   var steps = 0
@@ -1657,10 +1661,10 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
     var pc = work[wn]
     while true:
       inc steps
-      if steps > 4000: return false
+      if steps > maxSteps: return false
       if pc < 0 or pc >= pr.code.len: return false
-      if seen[pc]: break
-      seen[pc] = true
+      if rxSeen[pc] == gen: break
+      rxSeen[pc] = gen
       let op = pr.code[pc]
       if (op and roBack) != 0: return false
       case op
@@ -1712,7 +1716,7 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
 
 proc rxFirstSet(pr: var RxProg) =
   var lat: seq[bool] = @[]
-  if rxFirstFrom(pr, 0, lat):
+  if rxFirstFrom(pr, 0, lat, 4000):
     pr.firstLat = lat
     pr.hasFirst = true
   # per run: a filter on where its continuation can start
@@ -1745,10 +1749,10 @@ proc rxFirstSet(pr: var RxProg) =
     else: discard
     while pr.contTab.len <= k: pr.contTab.add -1
     while pr.altTab.len <= k: pr.altTab.add -1
-    if a >= 0 and rxFirstFrom(pr, a, lat):
+    if a >= 0 and rxFirstFrom(pr, a, lat, 200):
       pr.contTab[k] = pr.contLat.len
       pr.contLat.add lat
-    if b >= 0 and rxFirstFrom(pr, b, lat):
+    if b >= 0 and rxFirstFrom(pr, b, lat, 200):
       pr.altTab[k] = pr.contLat.len
       pr.contLat.add lat
     k += w
