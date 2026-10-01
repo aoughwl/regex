@@ -1419,7 +1419,10 @@ type
     fbits*: int              ## 1 g, 2 y, 4 d, 8 u or v
     hasFirst*: bool          ## firstLat is a valid filter
     firstLat*: seq[bool]     ## [c < 256]: may a match start at unit c?
-    contTab*: seq[int]       ## per roRun pc: index into contLat, or -1
+    contTab*: seq[int]       ## per pc: index into contLat, or -1 (roRun:
+                             ## its continuation; split: the preferred
+                             ## branch; roLoopHead: the body)
+    altTab*: seq[int]        ## per split pc: the other branch's filter
     contLat*: seq[seq[bool]] ## where a run's continuation may start
 
 var rxProgs*: seq[RxProg] = @[]   ## compiled programs; rxCompile returns an index
@@ -1636,6 +1639,8 @@ proc rxIsAnchored(p: RxP; nd: int): bool =
   if k == rkGroup: return rxIsAnchored(p, p.nodes[nd].kids[0])
   false
 
+var rxFirstEol = false   ## set by rxFirstFrom: some path ends in a non-m `$`
+
 proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
   ## A conservative Latin-1 filter on the first code unit of any match of
   ## the program from `start` at a position pos < n: lat[c] false = no
@@ -1643,6 +1648,7 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
   ## every zero-width and control instruction; false (no filter) at
   ## anything that can match empty or that it does not model.
   lat = @[]
+  rxFirstEol = false
   for c in 0 ..< 256: lat.add false
   var seen: seq[bool] = @[]
   for k in 0 ..< pr.code.len: seen.add false
@@ -1682,7 +1688,9 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
         inc wn
         if pr.code[pc+1] >= 1: break
         pc += 6
-      of roEol: break          # never holds at pos < n
+      of roEol:                # never holds at pos < n
+        rxFirstEol = true
+        break
       of roBol, roBolM, roEolM: inc pc
       of roWordB, roNotWordB, roMark, roLoopInit: pc += 2
       of roSaveGroup, roResetCaps: pc += 3
@@ -1712,6 +1720,14 @@ proc rxFirstSet(pr: var RxProg) =
   if rxFirstFrom(pr, 0, lat):
     pr.firstLat = lat
     pr.hasFirst = true
+    if not rxFirstEol and not pr.u and pr.firstOp < 0 and pr.firstUnit < 0:
+      # every match starts with a unit in firstLat (or one >= 256), never at
+      # the end: publish it as the first matcher, so a host's search loop
+      # skips the impossible starts without entering the matcher
+      var r: seq[int] = @[256, 0xFFFF]
+      pr.classes.add RxClass(r: r, invert: false, icase: false, lat: lat)
+      pr.firstOp = roClass
+      pr.firstArg = pr.classes.len - 1
   # per run: a filter on where its continuation can start
   var k = 0
   while k < pr.code.len:
@@ -1727,13 +1743,30 @@ proc rxFirstSet(pr: var RxProg) =
     of roLook: w = 4
     of roRun: w = 6
     else: w = 1
-    if (op and 63) == roRun and (pr.code[k+4] and roBack) == 0 and not pr.u:
-      if rxFirstFrom(pr, k + 6, lat):
-        while pr.contTab.len <= k: pr.contTab.add -1
-        pr.contTab[k] = pr.contLat.len
-        pr.contLat.add lat
+    var a = -1   # the pc whose filter goes in contTab[k]
+    var b = -1   # ... in altTab[k]
+    case op
+    of roRun:
+      if (pr.code[k+4] and roBack) == 0 and not pr.u: a = k + 6
+    of roSplitNext:
+      a = k + 2
+      b = pr.code[k+1]
+    of roSplitJump:
+      a = pr.code[k+1]
+      b = k + 2
+    of roLoopHead: a = k + 6
+    else: discard
+    while pr.contTab.len <= k: pr.contTab.add -1
+    while pr.altTab.len <= k: pr.altTab.add -1
+    if a >= 0 and rxFirstFrom(pr, a, lat):
+      pr.contTab[k] = pr.contLat.len
+      pr.contLat.add lat
+    if b >= 0 and rxFirstFrom(pr, b, lat):
+      pr.altTab[k] = pr.contLat.len
+      pr.contLat.add lat
     k += w
   while pr.contTab.len < pr.code.len: pr.contTab.add -1
+  while pr.altTab.len < pr.code.len: pr.altTab.add -1
 
 proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
   ## Parse + compile. Returns the program index, or -1 with `err` set.
@@ -1773,7 +1806,7 @@ proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
     return -1
   var pr = RxProg(code: @[], classes: @[], ncaps: p.ngroups + 1, nregs: 0, names: @[],
                   hasNames: p.hasNames, u: p.u, anchored: false, firstUnit: -1, firstOp: -1, firstArg: 0,
-                  hasFirst: false, firstLat: @[], contTab: @[], contLat: @[],
+                  hasFirst: false, firstLat: @[], contTab: @[], altTab: @[], contLat: @[],
                   fbits: (if rxHasFlagC(flags, 'g'): 1 else: 0) or (if rxHasFlagC(flags, 'y'): 2 else: 0) or
                          (if rxHasFlagC(flags, 'd'): 4 else: 0) or (if p.u: 8 else: 0))
   pr.names.add @[]
@@ -2103,6 +2136,7 @@ proc rxRunN*(pi, n, start: int): bool =
   if start < n and rxProgs[pi].hasFirst:
     let c0 = rxU(start)
     if c0 < 256 and not rxProgs[pi].firstLat[c0]: return false
+  let code = cast[ptr UncheckedArray[int]](addr rxProgs[pi].code[0])
   let ncap2 = rxProgs[pi].ncaps * 2
   let memLen = ncap2 + rxProgs[pi].nregs
   while rxMem.len < memLen: rxMem.add -1
@@ -2113,16 +2147,16 @@ proc rxRunN*(pi, n, start: int): bool =
   var pos = start
   while true:
     var failed = false
-    let op = rxProgs[pi].code[pc]
+    let op = code[pc]
     case op and 63
     of roChar, roCharI, roAny, roAnyAll, roClass:
-      if op == roChar and rxProgs[pi].code[pc+1] < 0xD800:
-        if pos < n and rxU(pos) == rxProgs[pi].code[pc+1]:
+      if op == roChar and code[pc+1] < 0xD800:
+        if pos < n and rxU(pos) == code[pc+1]:
           inc pos
           pc += 2
         elif not rxBacktrack(rxProgs[pi], n, pc, pos): return false
         continue
-      let np = rxMatch1(rxProgs[pi], op, rxProgs[pi].code[pc+1], n, pos)
+      let np = rxMatch1(rxProgs[pi], op, code[pc+1], n, pos)
       if np < 0: failed = true
       else:
         pos = np
@@ -2140,31 +2174,45 @@ proc rxRunN*(pi, n, start: int): bool =
       if pos != n and not rxIsLT(rxU(pos)): failed = true
       else: inc pc
     of roWordB, roNotWordB:
-      let extra = rxProgs[pi].code[pc+1] == 1
+      let extra = code[pc+1] == 1
       let a = pos > 0 and rxIsWordC(rxU(pos - 1), extra)
       let b = pos < n and rxIsWordC(rxU(pos), extra)
       let isB = a != b
       if isB != ((op and 63) == roWordB): failed = true
       else: pc += 2
-    of roSplitNext:
-      rxPush(rckAlt, rxProgs[pi].code[pc+1], pos, 0, 0, 0)
-      pc += 2
-    of roSplitJump:
-      rxPush(rckAlt, pc + 2, pos, 0, 0, 0)
-      pc = rxProgs[pi].code[pc+1]
+    of roSplitNext, roSplitJump:
+      var pref = pc + 2
+      var other = code[pc+1]
+      if (op and 63) == roSplitJump:
+        pref = other
+        other = pc + 2
+      var prefOk = true
+      var otherOk = true
+      if pos < n:
+        let c = rxU(pos)
+        if c < 256:
+          let ta = rxProgs[pi].contTab[pc]
+          if ta >= 0: prefOk = rxProgs[pi].contLat[ta][c]
+          let tb = rxProgs[pi].altTab[pc]
+          if tb >= 0: otherOk = rxProgs[pi].contLat[tb][c]
+      if prefOk:
+        if otherOk: rxPush(rckAlt, other, pos, 0, 0, 0)
+        pc = pref
+      elif otherOk: pc = other
+      else: failed = true
     of roJmp:
-      pc = rxProgs[pi].code[pc+1]
+      pc = code[pc+1]
     of roMark:
-      rxSet(ncap2 + rxProgs[pi].code[pc+1], pos)
+      rxSet(ncap2 + code[pc+1], pos)
       pc += 2
     of roSaveGroup:
-      let g = rxProgs[pi].code[pc+1]
-      let m = rxMem[ncap2 + rxProgs[pi].code[pc+2]]
+      let g = code[pc+1]
+      let m = rxMem[ncap2 + code[pc+2]]
       rxSet(2*g, min(m, pos))
       rxSet(2*g+1, max(m, pos))
       pc += 3
     of roResetCaps:
-      for g in rxProgs[pi].code[pc+1] .. rxProgs[pi].code[pc+2]:
+      for g in code[pc+1] .. code[pc+2]:
         rxSet(2*g, -1)
         rxSet(2*g+1, -1)
       pc += 3
@@ -2173,19 +2221,26 @@ proc rxRunN*(pi, n, start: int): bool =
       if np < 0: failed = true
       else:
         pos = np
-        pc += 3 + rxProgs[pi].code[pc+2]
+        pc += 3 + code[pc+2]
     of roLoopInit:
-      rxSet(ncap2 + rxProgs[pi].code[pc+1], 0)
+      rxSet(ncap2 + code[pc+1], 0)
       pc += 2
     of roLoopHead:
-      let cnt = rxMem[ncap2 + rxProgs[pi].code[pc+1]]
-      let mn = rxProgs[pi].code[pc+2]
-      let mx = rxProgs[pi].code[pc+3]
-      let greedy = rxProgs[pi].code[pc+4] == 1
-      let exitPc = rxProgs[pi].code[pc+5]
+      let cnt = rxMem[ncap2 + code[pc+1]]
+      let mn = code[pc+2]
+      let mx = code[pc+3]
+      let greedy = code[pc+4] == 1
+      let exitPc = code[pc+5]
+      var bodyOk = true
+      if pos < n:
+        let ta = rxProgs[pi].contTab[pc]
+        if ta >= 0:
+          let c = rxU(pos)
+          if c < 256: bodyOk = rxProgs[pi].contLat[ta][c]
       if cnt < mn:
-        pc += 6
-      elif cnt >= mx:
+        if bodyOk: pc += 6
+        else: failed = true
+      elif cnt >= mx or not bodyOk:
         pc = exitPc
       elif greedy:
         rxPush(rckAlt, exitPc, pos, 0, 0, 0)
@@ -2194,19 +2249,19 @@ proc rxRunN*(pi, n, start: int): bool =
         rxPush(rckAlt, pc + 6, pos, 0, 0, 0)
         pc = exitPc
     of roLoopTail:
-      let ci = ncap2 + rxProgs[pi].code[pc+1]
+      let ci = ncap2 + code[pc+1]
       let cnt = rxMem[ci]
-      if cnt >= rxProgs[pi].code[pc+3] and pos == rxMem[ncap2 + rxProgs[pi].code[pc+2]]:
+      if cnt >= code[pc+3] and pos == rxMem[ncap2 + code[pc+2]]:
         failed = true
       else:
         rxSet(ci, cnt + 1)
-        pc = rxProgs[pi].code[pc+4]
+        pc = code[pc+4]
     of roRun:
-      let mn = rxProgs[pi].code[pc+1]
-      let mx = rxProgs[pi].code[pc+2]
-      let greedy = rxProgs[pi].code[pc+3] == 1
-      let mop = rxProgs[pi].code[pc+4]
-      let marg = rxProgs[pi].code[pc+5]
+      let mn = code[pc+1]
+      let mx = code[pc+2]
+      let greedy = code[pc+3] == 1
+      let mop = code[pc+4]
+      let marg = code[pc+5]
       let cont = pc + 6
       var count = 0
       var p2 = pos
@@ -2252,12 +2307,12 @@ proc rxRunN*(pi, n, start: int): bool =
             let c = rxU(p2)
             if c < 256 and not rxProgs[pi].contLat[ti][c]: failed = true
     of roLook:
-      let neg = (rxProgs[pi].code[pc+1] and 1) == 1
-      rxPush(if neg: rckLookNeg else: rckLookPos, rxProgs[pi].code[pc+3], pos, 0, 0, 0)
-      rxSet(ncap2 + rxProgs[pi].code[pc+2], rxStkN - rxChW)
+      let neg = (code[pc+1] and 1) == 1
+      rxPush(if neg: rckLookNeg else: rckLookPos, code[pc+3], pos, 0, 0, 0)
+      rxSet(ncap2 + code[pc+2], rxStkN - rxChW)
       pc += 4
     of roLookEnd:
-      let b = rxMem[ncap2 + rxProgs[pi].code[pc+1]]
+      let b = rxMem[ncap2 + code[pc+1]]
       let kind = rxStk[b]
       let savedPos = rxStk[b+2]
       let cont = rxStk[b+1]
