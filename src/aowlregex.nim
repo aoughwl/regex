@@ -1639,8 +1639,6 @@ proc rxIsAnchored(p: RxP; nd: int): bool =
   if k == rkGroup: return rxIsAnchored(p, p.nodes[nd].kids[0])
   false
 
-var rxFirstEol = false   ## set by rxFirstFrom: some path ends in a non-m `$`
-
 proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
   ## A conservative Latin-1 filter on the first code unit of any match of
   ## the program from `start` at a position pos < n: lat[c] false = no
@@ -1648,7 +1646,6 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
   ## every zero-width and control instruction; false (no filter) at
   ## anything that can match empty or that it does not model.
   lat = @[]
-  rxFirstEol = false
   for c in 0 ..< 256: lat.add false
   var seen: seq[bool] = @[]
   for k in 0 ..< pr.code.len: seen.add false
@@ -1688,9 +1685,7 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]): bool =
         inc wn
         if pr.code[pc+1] >= 1: break
         pc += 6
-      of roEol:                # never holds at pos < n
-        rxFirstEol = true
-        break
+      of roEol: break          # never holds at pos < n
       of roBol, roBolM, roEolM: inc pc
       of roWordB, roNotWordB, roMark, roLoopInit: pc += 2
       of roSaveGroup, roResetCaps: pc += 3
@@ -1720,14 +1715,6 @@ proc rxFirstSet(pr: var RxProg) =
   if rxFirstFrom(pr, 0, lat):
     pr.firstLat = lat
     pr.hasFirst = true
-    if not rxFirstEol and not pr.u and pr.firstOp < 0 and pr.firstUnit < 0:
-      # every match starts with a unit in firstLat (or one >= 256), never at
-      # the end: publish it as the first matcher, so a host's search loop
-      # skips the impossible starts without entering the matcher
-      var r: seq[int] = @[256, 0xFFFF]
-      pr.classes.add RxClass(r: r, invert: false, icase: false, lat: lat)
-      pr.firstOp = roClass
-      pr.firstArg = pr.classes.len - 1
   # per run: a filter on where its continuation can start
   var k = 0
   while k < pr.code.len:
@@ -1932,6 +1919,11 @@ proc rxReadB(pos: int; u: bool; w: var int): int {.inline.} =
 
 proc rxMatch1*(pr: RxProg; op, arg, n, pos: int): int =
   ## A single-character matcher at pos; the new position or -1.
+  if op == roClass and not pr.u:
+    # the common case: a forward non-u class on a Latin-1 unit
+    if pos >= n: return -1
+    let c0 = rxU(pos)
+    if c0 < 256: return (if pr.classes[arg].lat[c0]: pos + 1 else: -1)
   let back = (op and roBack) != 0
   var w = 0
   var c = 0
