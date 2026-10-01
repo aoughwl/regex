@@ -32,6 +32,22 @@ proc checkErr(pattern, flags: string) =
     echo "FAIL expected SyntaxError for /", pattern, "/", flags
     inc failures
 
+# first-unit and run-continuation filters
+check("a.*b", "", "xaxxbxxbxx", 0, @[1, 8])
+check("a.*?b", "", "xaxxbxxb", 0, @[1, 5])
+check("<[^>]*?(?=>)", "", "a<bc>d", 0, @[1, 4])
+check("x(?=[ab]|$)", "", "xcxa", 0, @[2, 3])
+check("x(?=[ab]|$)", "", "xcx", 0, @[2, 3])
+check(r"\w+?(?:$|!)", "", "ab cd!", 0, @[3, 6])
+check("(?:a|b)*?c", "", "ababc", 0, @[0, 5])
+check("[a-c]{2,}?d", "i", "xABCd", 0, @[1, 5])
+check("a{2,3}b", "", "aaaab", 0, @[1, 5])
+check("(?<=a)b", "", "cbab", 0, @[3, 4])
+check("(a+)+b", "", "aaac aab", 0, @[5, 8, 5, 7])
+check(r"\s*$", "", "ab  ", 0, @[2, 4])
+check(".*", "", "", 0, @[0, 0])
+check("[^x]*x", "", "abc", 0, @[])
+check("(?:ab)*c", "", "abababx abc", 0, @[8, 11])
 # basics, alternation, quantifiers
 check("a(b|c)+d", "", "xxabcbd", 0, @[2, 7, 5, 6])
 check(r"\d{2,3}", "", "a1234", 0, @[1, 4])
