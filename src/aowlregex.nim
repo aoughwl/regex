@@ -47,9 +47,7 @@ proc rxHasFlagC*(fs: string; c: char): bool =
   false
 
 
-proc rxCanon*(c: int; u: bool): int =
-  ## Canonicalize(rer, ch): simple case folding in u/v mode, toUppercase
-  ## (with the Annex-free 22.2.2.7.3 restrictions) otherwise.
+proc rxCanonSlow(c: int; u: bool): int =
   if u:
     if c < 128:
       if c >= 65 and c <= 90: return c + 32
@@ -59,6 +57,35 @@ proc rxCanon*(c: int; u: bool): int =
     if c >= 97 and c <= 122: return c - 32
     return c
   caseMapLookup(upSrc, upDst, c)
+
+var rxCanonLat: seq[int] = @[]   ## [0..255] non-u, [256..511] u: rxCanonSlow of c < 256
+var rxCanonInv: seq[seq[int]] = @[]  ## [x] non-u, [0x400+x] u: the c < 256 with canon(c) == x < 0x400
+
+proc rxCanonInit() =
+  initCaseMaps()
+  rxCanonLat = newSeq[int](512)
+  for c in 0 ..< 256:
+    rxCanonLat[c] = rxCanonSlow(c, false)
+    rxCanonLat[256 + c] = rxCanonSlow(c, true)
+  rxCanonInv = newSeq[seq[int]](0x800)
+  for c in 0 ..< 256:
+    let a = rxCanonLat[c]
+    if a < 0x400: rxCanonInv[a].add c
+    let b = rxCanonLat[256 + c]
+    if b < 0x400: rxCanonInv[0x400 + b].add c
+
+proc rxCanon*(c: int; u: bool): int =
+  ## Canonicalize(rer, ch): simple case folding in u/v mode, toUppercase
+  ## (with the Annex-free 22.2.2.7.3 restrictions) otherwise.
+  if c < 128:
+    if u:
+      if c >= 65 and c <= 90: return c + 32
+    elif c >= 97 and c <= 122: return c - 32
+    return c
+  if c < 256:
+    if rxCanonLat.len == 0: rxCanonInit()
+    return rxCanonLat[(if u: 256 else: 0) + c]
+  rxCanonSlow(c, u)
 
 proc rsNormalize(r: var seq[int]) =
   ## Sort the [lo,hi] pairs by lo and merge overlapping/adjacent ones.
@@ -1637,19 +1664,23 @@ proc rxIsAnchored(p: RxP; nd: int): bool =
   if k == rkSeq and p.nodes[nd].kids.len > 0:
     return rxIsAnchored(p, p.nodes[nd].kids[0])
   if k == rkGroup: return rxIsAnchored(p, p.nodes[nd].kids[0])
+  if k == rkAlt and p.nodes[nd].kids.len > 0:
+    # ^a|^b: every alternative is anchored
+    for kd in p.nodes[nd].kids:
+      if not rxIsAnchored(p, kd): return false
+    return true
   false
 
 var rxSeen: seq[int] = @[]   ## rxFirstFrom's visited marks (generation stamps)
 var rxSeenGen = 0
 
-proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]; maxSteps: int): bool =
+proc rxFirstFrom(pr: var RxProg; start: int; lat: var seq[bool]; maxSteps: int): bool =
   ## A conservative Latin-1 filter on the first code unit of any match of
   ## the program from `start` at a position pos < n: lat[c] false = no
   ## match can proceed where the subject holds unit c (c < 256). Walks over
   ## every zero-width and control instruction; false (no filter) at
   ## anything that can match empty or that it does not model.
-  lat = @[]
-  for c in 0 ..< 256: lat.add false
+  lat = newSeq[bool](256)
   while rxSeen.len < pr.code.len: rxSeen.add 0
   inc rxSeenGen
   let gen = rxSeenGen
@@ -1670,16 +1701,22 @@ proc rxFirstFrom(pr: RxProg; start: int; lat: var seq[bool]; maxSteps: int): boo
       case op
       of roChar, roCharI, roAny, roAnyAll, roClass:
         let arg = pr.code[pc+1]
-        for c in 0 ..< 256:
-          if not lat[c]:
-            var ok = false
-            case op
-            of roChar: ok = c == arg
-            of roCharI: ok = c == arg or rxCanon(c, pr.u) == arg
-            of roAny: ok = not rxIsLT(c)
-            of roAnyAll: ok = true
-            else: ok = pr.classes[arg].lat[c]
-            if ok: lat[c] = true
+        case op
+        of roChar:
+          if arg < 256: lat[arg] = true
+        of roCharI:
+          if arg < 256: lat[arg] = true
+          if arg < 0x400:   # no unit < 256 canonicalizes past this
+            if rxCanonLat.len == 0: rxCanonInit()
+            for c in rxCanonInv[(if pr.u: 0x400 else: 0) + arg]: lat[c] = true
+        of roAny:
+          for c in 0 ..< 256:
+            if not rxIsLT(c): lat[c] = true
+        of roAnyAll:
+          for c in 0 ..< 256: lat[c] = true
+        else:
+          for c in 0 ..< 256:
+            if pr.classes[arg].lat[c]: lat[c] = true
         break
       of roRun:
         let mop = pr.code[pc+4]
@@ -1921,7 +1958,7 @@ proc rxReadB(pos: int; u: bool; w: var int): int {.inline.} =
       return 0x10000 + ((d - 0xD800) shl 10) + (c - 0xDC00)
   c
 
-proc rxMatch1*(pr: RxProg; op, arg, n, pos: int): int =
+proc rxMatch1*(pr: var RxProg; op, arg, n, pos: int): int =
   ## A single-character matcher at pos; the new position or -1.
   if op == roClass and not pr.u:
     # the common case: a forward non-u class on a Latin-1 unit
@@ -1952,7 +1989,7 @@ proc rxMatch1*(pr: RxProg; op, arg, n, pos: int): int =
   if not ok: return -1
   if back: pos - w else: pos + w
 
-proc rxRunFwd(pr: RxProg; mop, marg, n, pos, mx: int): int =
+proc rxRunFwd(pr: var RxProg; mop, marg, n, pos, mx: int): int =
   ## Non-u forward greedy run of a single-unit matcher: the end of the
   ## longest run of at most mx matches from pos (each match is one unit).
   var lim = n
@@ -1979,7 +2016,7 @@ proc rxRunFwd(pr: RxProg; mop, marg, n, pos, mx: int): int =
     while p < lim and rxMatch1(pr, mop, marg, n, p) >= 0: inc p
   p
 
-proc rxBackref(pr: RxProg; pc, n, pos: int): int =
+proc rxBackref(pr: var RxProg; pc, n, pos: int): int =
   ## The new position after a backreference, or -1.
   let op = pr.code[pc]
   let back = (op and roBack) != 0
@@ -2026,7 +2063,7 @@ proc rxBackref(pr: RxProg; pc, n, pos: int): int =
        rxU(g0 - 1) >= 0xD800 and rxU(g0 - 1) <= 0xDBFF: return -1
   if back: pos - ln else: pos + ln
 
-proc rxBacktrack(pr: RxProg; n: int; pc, pos: var int): bool =
+proc rxBacktrack(pr: var RxProg; n: int; pc, pos: var int): bool =
   ## Resume at the most recent live choice point; false when none is left.
   while true:
     let top = rxStkN - rxChW
@@ -2332,6 +2369,8 @@ proc rxRunN*(pi, n, start: int): bool =
 # ===========================================================================
 # 5. Searching, and a convenience API.
 
+proc rxMemchr(p: pointer; c: cint; n: csize_t): pointer {.importc: "memchr", header: "<string.h>".}
+
 proc rxAdvanceN*(n, index: int; unicode: bool): int =
   ## AdvanceStringIndex over the bound subject.
   if not unicode: return index + 1
@@ -2358,7 +2397,14 @@ proc rxScanN*(pi, n, li0: int; fullUnicode: bool): int =
     let fu = rxProgs[pi].firstUnit
     if fu >= 0:
       var k = st
-      while k < n and rxU(k) != fu: inc k
+      if rxIsWide:
+        while k < n and int(rxWideP[k]) != fu: inc k
+      elif fu < 256:
+        if k < n:
+          let base = cast[uint](rxNarrowP)
+          let hit = rxMemchr(cast[pointer](base + uint(k)), cint(fu), csize_t(n - k))
+          k = (if hit == nil: n else: int(cast[uint](hit) - base))
+      else: k = n
       if k >= n: return -1
       if k > st:
         st = k
@@ -2367,7 +2413,11 @@ proc rxScanN*(pi, n, li0: int; fullUnicode: bool): int =
       let fop = rxProgs[pi].firstOp
       let farg = rxProgs[pi].firstArg
       var k = st
-      while k < n and rxMatch1(rxProgs[pi], fop, farg, n, k) < 0: inc k
+      if fop == roClass and not rxIsWide:
+        let cl = cast[ptr UncheckedArray[bool]](addr rxProgs[pi].classes[farg].lat[0])
+        while k < n and not cl[int(uint8(rxNarrowP[k]))]: inc k
+      else:
+        while k < n and rxMatch1(rxProgs[pi], fop, farg, n, k) < 0: inc k
       if k >= n: return -1
       if k > st:
         st = k
@@ -2375,10 +2425,14 @@ proc rxScanN*(pi, n, li0: int; fullUnicode: bool): int =
     elif rxProgs[pi].hasFirst and not fullUnicode:
       # skip the units no match can start with (a match may still start at n)
       var k = st
-      while k < n:
-        let c = rxU(k)
-        if c >= 256 or rxProgs[pi].firstLat[c]: break
-        inc k
+      let fl = cast[ptr UncheckedArray[bool]](addr rxProgs[pi].firstLat[0])
+      if rxIsWide:
+        while k < n:
+          let c = int(rxWideP[k])
+          if c >= 256 or fl[c]: break
+          inc k
+      else:
+        while k < n and not fl[int(uint8(rxNarrowP[k]))]: inc k
       if k > st:
         st = k
         li = k
