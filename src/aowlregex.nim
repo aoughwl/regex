@@ -1451,6 +1451,10 @@ type
                              ## branch; roLoopHead: the body)
     altTab*: seq[int]        ## per split pc: the other branch's filter
     contLat*: seq[seq[bool]] ## where a run's continuation may start
+    contNeed*: seq[bool]     ## per contLat: no match from there at pos = n
+    firstNeed*: bool         ## hasFirst and no match can start at n
+    exact*: bool             ## the pattern is ^(?:lit|lit|...)$ (no flags i m,
+    exactSet*: seq[seq[int]] ## no groups): a match is the whole subject in exactSet
 
 var rxProgs*: seq[RxProg] = @[]   ## compiled programs; rxCompile returns an index
 
@@ -1671,8 +1675,66 @@ proc rxIsAnchored(p: RxP; nd: int): bool =
     return true
   false
 
+proc rxLitStrings(p: RxP; nd: int; res: var seq[seq[int]]): bool =
+  ## The finite set of literal strings node nd matches (case-sensitive, no
+  ## surrogates), or false.
+  let k = p.nodes[nd].kind
+  case k
+  of rkEmpty:
+    res = @[newSeq[int](0)]
+  of rkChar:
+    let c = p.nodes[nd].ch
+    if c >= 0xD800: return false
+    res = @[@[c]]
+  of rkMod:
+    if p.nodes[nd].addF != 0 or p.nodes[nd].remF != 0: return false
+    return rxLitStrings(p, p.nodes[nd].kids[0], res)
+  of rkAlt:
+    res = @[]
+    for kd in p.nodes[nd].kids:
+      var sub: seq[seq[int]] = @[]
+      if not rxLitStrings(p, kd, sub): return false
+      for x in sub: res.add x
+      if res.len > 256: return false
+  of rkSeq:
+    res = @[newSeq[int](0)]
+    for kd in p.nodes[nd].kids:
+      var sub: seq[seq[int]] = @[]
+      if not rxLitStrings(p, kd, sub): return false
+      var nx: seq[seq[int]] = @[]
+      for a in res:
+        for b in sub:
+          var c = a
+          for x in b: c.add x
+          nx.add c
+      if nx.len > 256: return false
+      res = nx
+  else: return false
+  true
+
+proc rxExactSet(p: RxP; root: int; fl: int; pr: var RxProg) =
+  if (fl and (rmfI or rmfM)) != 0 or p.ngroups != 0: return
+  if p.nodes[root].kind != rkSeq: return
+  let ks = p.nodes[root].kids
+  if ks.len < 2 or p.nodes[ks[0]].kind != rkBol or p.nodes[ks[ks.len-1]].kind != rkEol: return
+  var res: seq[seq[int]] = @[newSeq[int](0)]
+  for i in 1 ..< ks.len - 1:
+    var sub: seq[seq[int]] = @[]
+    if not rxLitStrings(p, ks[i], sub): return
+    var nx: seq[seq[int]] = @[]
+    for a in res:
+      for b in sub:
+        var c = a
+        for x in b: c.add x
+        nx.add c
+    if nx.len > 256: return
+    res = nx
+  pr.exact = true
+  pr.exactSet = res
+
 var rxSeen: seq[int] = @[]   ## rxFirstFrom's visited marks (generation stamps)
 var rxSeenGen = 0
+var rxFirstSawEnd = false   ## rxFirstFrom met a $ (a path that consumes nothing)
 
 proc rxFirstFrom(pr: var RxProg; start: int; lat: var seq[bool]; maxSteps: int): bool =
   ## A conservative Latin-1 filter on the first code unit of any match of
@@ -1681,6 +1743,7 @@ proc rxFirstFrom(pr: var RxProg; start: int; lat: var seq[bool]; maxSteps: int):
   ## every zero-width and control instruction; false (no filter) at
   ## anything that can match empty or that it does not model.
   lat = newSeq[bool](256)
+  rxFirstSawEnd = false
   while rxSeen.len < pr.code.len: rxSeen.add 0
   inc rxSeenGen
   let gen = rxSeenGen
@@ -1726,7 +1789,9 @@ proc rxFirstFrom(pr: var RxProg; start: int; lat: var seq[bool]; maxSteps: int):
         inc wn
         if pr.code[pc+1] >= 1: break
         pc += 6
-      of roEol: break          # never holds at pos < n
+      of roEol:                # never holds at pos < n
+        rxFirstSawEnd = true
+        break
       of roBol, roBolM, roEolM: inc pc
       of roWordB, roNotWordB, roMark, roLoopInit: pc += 2
       of roSaveGroup, roResetCaps: pc += 3
@@ -1756,6 +1821,7 @@ proc rxFirstSet(pr: var RxProg) =
   if rxFirstFrom(pr, 0, lat, 4000):
     pr.firstLat = lat
     pr.hasFirst = true
+    pr.firstNeed = not rxFirstSawEnd
   # per run: a filter on where its continuation can start
   var k = 0
   while k < pr.code.len:
@@ -1789,9 +1855,11 @@ proc rxFirstSet(pr: var RxProg) =
     if a >= 0 and rxFirstFrom(pr, a, lat, 200):
       pr.contTab[k] = pr.contLat.len
       pr.contLat.add lat
+      pr.contNeed.add(not rxFirstSawEnd)
     if b >= 0 and rxFirstFrom(pr, b, lat, 200):
       pr.altTab[k] = pr.contLat.len
       pr.contLat.add lat
+      pr.contNeed.add(not rxFirstSawEnd)
     k += w
   while pr.contTab.len < pr.code.len: pr.contTab.add -1
   while pr.altTab.len < pr.code.len: pr.altTab.add -1
@@ -1834,7 +1902,7 @@ proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
     return -1
   var pr = RxProg(code: @[], classes: @[], ncaps: p.ngroups + 1, nregs: 0, names: @[],
                   hasNames: p.hasNames, u: p.u, anchored: false, firstUnit: -1, firstOp: -1, firstArg: 0,
-                  hasFirst: false, firstLat: @[], contTab: @[], altTab: @[], contLat: @[],
+                  hasFirst: false, firstLat: @[], contTab: @[], altTab: @[], contLat: @[], contNeed: @[], firstNeed: false, exact: false, exactSet: @[],
                   fbits: (if rxHasFlagC(flags, 'g'): 1 else: 0) or (if rxHasFlagC(flags, 'y'): 2 else: 0) or
                          (if rxHasFlagC(flags, 'd'): 4 else: 0) or (if p.u: 8 else: 0))
   pr.names.add @[]
@@ -1859,6 +1927,7 @@ proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
         pr.firstOp = mop
         pr.firstArg = pr.code[fpc+5]
   rxFirstSet(pr)
+  rxExactSet(p, root, fl, pr)
   rxProgs.add pr
   rxProgs.len - 1
 
@@ -2166,9 +2235,30 @@ proc rxRunN*(pi, n, start: int): bool =
   ## Try to match program `pi` against the bound subject (length n) at
   ## exactly `start`. On success rxMem[0..1] is the match and
   ## rxMem[2g..2g+1] the captures (-1 = unset).
-  if start < n and rxProgs[pi].hasFirst:
-    let c0 = rxU(start)
-    if c0 < 256 and not rxProgs[pi].firstLat[c0]: return false
+  if start < n:
+    if rxProgs[pi].hasFirst:
+      let c0 = rxU(start)
+      if c0 < 256 and not rxProgs[pi].firstLat[c0]: return false
+  elif rxProgs[pi].firstNeed: return false
+  if rxProgs[pi].exact:
+    # ^(?:lit|...)$: the whole subject is one of the strings
+    if start != 0: return false
+    var found = false
+    for x in rxProgs[pi].exactSet:
+      if x.len == n:
+        var eq = true
+        for k in 0 ..< n:
+          if rxU(k) != x[k]:
+            eq = false
+            break
+        if eq:
+          found = true
+          break
+    if not found: return false
+    while rxMem.len < 2: rxMem.add -1
+    rxMem[0] = 0
+    rxMem[1] = n
+    return true
   let code = cast[ptr UncheckedArray[int]](addr rxProgs[pi].code[0])
   let ncap2 = rxProgs[pi].ncaps * 2
   let memLen = ncap2 + rxProgs[pi].nregs
@@ -2228,6 +2318,11 @@ proc rxRunN*(pi, n, start: int): bool =
           if ta >= 0: prefOk = rxProgs[pi].contLat[ta][c]
           let tb = rxProgs[pi].altTab[pc]
           if tb >= 0: otherOk = rxProgs[pi].contLat[tb][c]
+      else:
+        let ta = rxProgs[pi].contTab[pc]
+        if ta >= 0: prefOk = not rxProgs[pi].contNeed[ta]
+        let tb = rxProgs[pi].altTab[pc]
+        if tb >= 0: otherOk = not rxProgs[pi].contNeed[tb]
       if prefOk:
         if otherOk: rxPush(rckAlt, other, pos, 0, 0, 0)
         pc = pref
@@ -2270,6 +2365,9 @@ proc rxRunN*(pi, n, start: int): bool =
         if ta >= 0:
           let c = rxU(pos)
           if c < 256: bodyOk = rxProgs[pi].contLat[ta][c]
+      else:
+        let ta = rxProgs[pi].contTab[pc]
+        if ta >= 0: bodyOk = not rxProgs[pi].contNeed[ta]
       if cnt < mn:
         if bodyOk: pc += 6
         else: failed = true
@@ -2311,6 +2409,7 @@ proc rxRunN*(pi, n, start: int): bool =
           if ti >= 0 and p2 < n:
             let c = rxU(p2)
             if c < 256 and not rxProgs[pi].contLat[ti][c]: failed = true
+          elif ti >= 0 and rxProgs[pi].contNeed[ti]: failed = true
       elif greedy:
         while count < mx:
           let np = rxMatch1(rxProgs[pi], mop, marg, n, p2)
@@ -2339,6 +2438,7 @@ proc rxRunN*(pi, n, start: int): bool =
           if ti >= 0 and p2 < n:
             let c = rxU(p2)
             if c < 256 and not rxProgs[pi].contLat[ti][c]: failed = true
+          elif ti >= 0 and rxProgs[pi].contNeed[ti]: failed = true
     of roLook:
       let neg = (code[pc+1] and 1) == 1
       rxPush(if neg: rckLookNeg else: rckLookPos, code[pc+3], pos, 0, 0, 0)
