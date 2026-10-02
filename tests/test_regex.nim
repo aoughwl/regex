@@ -1,6 +1,6 @@
 ## Run: nimony c -p:src -p:../unicode/src tests/test_regex.nim  (then the binary)
 import std/syncio
-import aowlregex
+import regex
 
 var failures = 0
 var total = 0

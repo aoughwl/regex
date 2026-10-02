@@ -1,4 +1,4 @@
-## aowlregex: an ECMAScript (ES2025) regular-expression engine over UTF-16
+## regex: an ECMAScript (ES2025) regular-expression engine over UTF-16
 ## code units - the matcher/compiler core of the aowljs JavaScript engine,
 ## with no dependency on any JS value model.
 ##
@@ -12,7 +12,7 @@
 ## uppercase otherwise) and Annex B legacy syntax in non-u mode.
 ##
 ## Layout:
-##   1. char-set ops over [lo, hi] range lists (tables: aowlunicode)
+##   1. char-set ops over [lo, hi] range lists (tables: unicode)
 ##   2. the pattern parser (source -> node tree, all early errors)
 ##   3. the compiler (node tree -> a small backtracking bytecode)
 ##   4. the matcher: an explicit choice-point stack + an undo trail, so
@@ -29,7 +29,7 @@
 ##   rxProgs[pi]                         ncaps, names, u, fbits, ...
 ## Global state: the matcher is not reentrant and not thread-safe.
 
-import aowlunicode/[proptables, ranges]
+import unicode/[proptables, ranges]
 
 # ===========================================================================
 # 1. Tables and character sets.

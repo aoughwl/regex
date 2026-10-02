@@ -1,9 +1,9 @@
-# aowlregex
+# regex
 
 An ECMAScript (ES2025) regular-expression engine for [nimony](https://github.com/nim-lang/nimony),
 operating on UTF-16 code units: the parser, compiler and backtracking matcher of the aowljs
 JavaScript engine, with no dependency on any JS value model. Depends on
-[aowlunicode](https://github.com/aoughwl/unicode) for property tables and case folding.
+[unicode](https://github.com/aoughwl/unicode) for property tables and case folding.
 
 Supported: flags `d g i m s u v y`; named groups (incl. duplicate names across alternatives);
 lookahead and lookbehind; numbered and named backreferences; modifiers `(?i:...)`; `\p{...}`
@@ -18,7 +18,7 @@ pathological patterns never recurse on the Nim stack.
 Convenience layer:
 
 ```nim
-import aowlregex
+import regex
 var err = ""
 let re = compileRegex(r"(?<y>\d{4})-(?<m>\d\d)", "u", err)   # -1 and err on SyntaxError
 let caps = execAt(re, "on 2024-05!", 0)   # @[3, 10, 3, 7, 8, 10]; @[] = no match
