@@ -59,6 +59,7 @@ proc rxCanonSlow(c: int; u: bool): int =
   caseMapLookup(upSrc, upDst, c)
 
 var rxCanonLat: seq[int] = @[]   ## [0..255] non-u, [256..511] u: rxCanonSlow of c < 256
+var rxCanonLow = true   ## every canon(c < 256) is < 0x400 (rxCanonInv is complete)
 var rxCanonInv: seq[seq[int]] = @[]  ## [x] non-u, [0x400+x] u: the c < 256 with canon(c) == x < 0x400
 
 proc rxCanonInit() =
@@ -71,8 +72,10 @@ proc rxCanonInit() =
   for c in 0 ..< 256:
     let a = rxCanonLat[c]
     if a < 0x400: rxCanonInv[a].add c
+    else: rxCanonLow = false
     let b = rxCanonLat[256 + c]
     if b < 0x400: rxCanonInv[0x400 + b].add c
+    else: rxCanonLow = false
 
 proc rxCanon*(c: int; u: bool): int =
   ## Canonicalize(rer, ch): simple case folding in u/v mode, toUppercase
@@ -161,8 +164,29 @@ proc rsInter(a, b: seq[int]): seq[int] =
 proc rsSub(a, b: seq[int]): seq[int] =
   rsInter(a, rsComplement(b, 0x10FFFF))
 
+var rsCanonMemoIn: seq[seq[int]] = @[]   ## rsCanonSet's last answers (a /i
+var rsCanonMemoU: seq[bool] = @[]         ## class such as [a-z] recurs across
+var rsCanonMemoOut: seq[seq[int]] = @[]  ## many patterns), round-robin
+var rsCanonMemoNext = 0
+
+proc rsCanonSet1(r: seq[int]; u: bool): seq[int]
+
 proc rsCanonSet(r: seq[int]; u: bool): seq[int] =
   ## { Canonicalize(c) | c in r }.
+  for k in 0 ..< rsCanonMemoIn.len:
+    if rsCanonMemoU[k] == u and rsCanonMemoIn[k] == r: return rsCanonMemoOut[k]
+  result = rsCanonSet1(r, u)
+  if rsCanonMemoIn.len < 64:
+    rsCanonMemoIn.add r
+    rsCanonMemoU.add u
+    rsCanonMemoOut.add result
+  else:
+    rsCanonMemoIn[rsCanonMemoNext] = r
+    rsCanonMemoU[rsCanonMemoNext] = u
+    rsCanonMemoOut[rsCanonMemoNext] = result
+    rsCanonMemoNext = (rsCanonMemoNext + 1) mod 64
+
+proc rsCanonSet1(r: seq[int]; u: bool): seq[int] =
   initCaseMaps()
   var rem: seq[int] = @[]
   var add: seq[int] = @[]
@@ -1485,9 +1509,28 @@ proc rxEmitMatcher(p: RxP; pr: var RxProg; nd: int; back: bool; fl: int) =
     let st = p.sets[p.nodes[nd].ch]
     var cl = RxClass(r: st.r, invert: p.nodes[nd].neg, icase: icase, lat: @[])
     if icase: cl.r = rsCanonSet(st.r, pr.u)
-    for c in 0 ..< 256:
-      let x = if icase: rxCanon(c, pr.u) else: c
-      cl.lat.add(rsHas(cl.r, x) != cl.invert)
+    # lat by walking the ranges (not 256 binary searches)
+    cl.lat = newSeq[bool](256)
+    if icase and rxCanonLat.len == 0: rxCanonInit()
+    let ib = if pr.u: 0x400 else: 0
+    var k = 0
+    while k + 1 < cl.r.len:
+      let lo = cl.r[k]
+      if icase and not rxCanonLow:
+        for c in 0 ..< 256:
+          if rsHas(cl.r, rxCanon(c, pr.u)): cl.lat[c] = true
+        break
+      if icase:
+        # c < 256 is in iff canon(c) is in; every canon(c) is < 0x400
+        let hi = min(cl.r[k+1], 0x3FF)
+        for x in lo .. hi:
+          for c in rxCanonInv[ib + x]: cl.lat[c] = true
+      else:
+        let hi = min(cl.r[k+1], 255)
+        for c in lo .. hi: cl.lat[c] = true
+      k += 2
+    if cl.invert:
+      for c in 0 ..< 256: cl.lat[c] = not cl.lat[c]
     pr.classes.add cl
     rxEmit(pr, roClass or b)
     rxEmit(pr, pr.classes.len - 1)
@@ -1769,8 +1812,11 @@ proc rxFirstFrom(pr: var RxProg; start: int; lat: var seq[bool]; maxSteps: int):
           if arg < 256: lat[arg] = true
         of roCharI:
           if arg < 256: lat[arg] = true
-          if arg < 0x400:   # no unit < 256 canonicalizes past this
-            if rxCanonLat.len == 0: rxCanonInit()
+          if rxCanonLat.len == 0: rxCanonInit()
+          if not rxCanonLow:
+            for c in 0 ..< 256:
+              if rxCanon(c, pr.u) == arg: lat[c] = true
+          elif arg < 0x400:   # no unit < 256 canonicalizes past this
             for c in rxCanonInv[(if pr.u: 0x400 else: 0) + arg]: lat[c] = true
         of roAny:
           for c in 0 ..< 256:
