@@ -1953,7 +1953,7 @@ proc rxCompile*(pattern: seq[int]; flags: string; err: var string): int =
                          (if rxHasFlagC(flags, 'd'): 4 else: 0) or (if p.u: 8 else: 0))
   pr.names.add @[]
   for g in 0 ..< p.ngroups:
-    let nm = if g < p.groupNames.len: p.groupNames[g] else: @[]
+    let nm = if g < p.groupNames.len: p.groupNames[g] else: newSeq[int]()
     pr.names.add nm
   rxCompileNode(p, pr, root, false, fl)
   rxEmit(pr, roMatch)
@@ -2033,7 +2033,16 @@ proc rxPush(kind, pc, pos, x, y, z: int) {.inline.} =
 # rxBindWide / rxBindNarrow. The caller keeps the storage alive and unmoved
 # while matching.
 var
-  rxDummyW: seq[uint16] = @[0'u16]
+  rxDummyW: array[1, uint16] = [0'u16]
+    ## a fixed-size array, NOT a seq: a module-level `seq` literal allocates
+    ## at module-init time (one element, same as this), which under a host
+    ## that provides its OWN GC allocator (nimony `-d:aowlgc`, e.g.
+    ## aowlvm/titicaca's P12 one-shared-heap merge) can self-boot that
+    ## allocator's lazy fallback heap before the host's own explicit
+    ## `aowlgcShimInit(h)` ever runs -- two heap instances instead of one.
+    ## This dummy's only job is a non-null sentinel address (see rxBindWide's
+    ## comment below); it never resizes, so a plain array needs no heap at
+    ## all and sidesteps the hazard entirely.
   rxDummyN = " "
   rxWideP = cast[ptr UncheckedArray[uint16]](addr rxDummyW[0])
   rxNarrowP = cast[ptr UncheckedArray[char]](toCString(rxDummyN))
